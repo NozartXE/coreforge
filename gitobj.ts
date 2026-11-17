@@ -1,8 +1,7 @@
 import { createHash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
 export interface GitObjectData { type:'commit'|'tree'|'blob'|'tag'; data:Buffer }
-const sha=(b:Buffer)=>createHash('sha1').update(b).digest('hex');
-export function hashObject(type:string,data:Buffer|string):string{const b=Buffer.isBuffer(data)?data:Buffer.from(data);return sha(Buffer.concat([Buffer.from(`${type} ${b.length}\0`),b]));}
+export function hashObject(type:string,data:Buffer|string):string{const b=Buffer.isBuffer(data)?data:Buffer.from(data);return createHash('sha1').update(`${type} ${b.length}\0`).update(b).digest('hex');}
 export function parseCommit(data:Buffer):{tree:string;parents:string[];author:string;committer:string;message:string}{const s=data.toString('utf8'),i=s.indexOf('\n\n'),h=s.slice(0,i<0?s.length:i),message=i<0?'':s.slice(i+2);const lines=h.split('\n');return{tree:lines.find(x=>x.startsWith('tree '))?.slice(5)||'',parents:lines.filter(x=>x.startsWith('parent ')).map(x=>x.slice(7)),author:lines.find(x=>x.startsWith('author '))?.slice(7)||'',committer:lines.find(x=>x.startsWith('committer '))?.slice(10)||'',message};}
 export function buildCommit(c:{tree:string;parents:string[];author:string;committer:string;message:string}):Buffer{return Buffer.from([`tree ${c.tree}`,...c.parents.map(x=>`parent ${x}`),`author ${c.author}`,`committer ${c.committer}`,'',c.message].join('\n'));}
 export function formatPerson(name:string,email:string,isoTimestamp:string):string{return `${name} <${email}> ${Math.floor(Date.parse(isoTimestamp)/1000)} +0000`;}
