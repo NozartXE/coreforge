@@ -7,13 +7,14 @@ const repoKey=(owner:string,name:string)=>`${owner}/${name}`;
 const lookup=(r:RepoRecord)=>(oid:string)=>r.objects.get(oid);
 function packets(buf:Buffer){const rd=new PktReader(buf),out:{kind:'line'|'flush'|'delim';data:Buffer}[]=[];for(;;){const p=rd.next();if(!p)break;out.push(p.type==='line'?{kind:'line',data:p.payload}:{kind:p.type,data:Buffer.alloc(0)});}if((rd as unknown as {p:number}).p!==buf.length)throw Error('trailing partial pkt-line');return out;}
 const line=(s:string)=>pktLine(s);
+const V2_ADVERTISEMENT=Buffer.concat(['version 2\n','agent=coreforge/1.0\n','ls-refs=unborn\n','fetch=shallow wait-for-done\n','object-format=sha1\n'].map(line).concat(pktFlush()));
 function refsSorted(r:RepoRecord){return [...r.refs].sort(([a],[b])=>{const rank=(x:string)=>x.startsWith('refs/heads/')?0:x.startsWith('refs/tags/')?1:2;return rank(a)-rank(b)||a.localeCompare(b);});}
 function fingerprint(r:RepoRecord){return refsSorted(r).map(([n,o])=>`${n}=${o}`).join('|');}
 const cache=new Map<string,Buffer>();
 export function handleInfoRefs(store:Store,owner:string,repoName:string,service:string,gitProtocolHeader=''):Result|null{
  const r=store.repo(owner,repoName);if(!r)return null;if(service!=='git-upload-pack'&&service!=='git-receive-pack')return {status:400,contentType:'text/plain',body:Buffer.from('Bad service')};
  const v2=service==='git-upload-pack'&&gitProtocolHeader.includes('version=2');
- if(v2){return {status:200,contentType:'application/x-git-upload-pack-advertisement',body:Buffer.concat(['version 2\n','agent=coreforge/1.0\n','ls-refs=unborn\n','fetch=shallow wait-for-done\n','object-format=sha1\n'].map(line).concat(pktFlush()))};}
+ if(v2){return {status:200,contentType:'application/x-git-upload-pack-advertisement',body:V2_ADVERTISEMENT};}
  const caps=service==='git-upload-pack'?'multi_ack thin-pack side-band side-band-64k ofs-delta shallow deepen-since deepen-not deepen-relative multi_ack_detailed no-done object-format=sha1 agent=coreforge/1.0':'report-status side-band-64k delete-refs quiet ofs-delta object-format=sha1 agent=coreforge/1.0';
  const out=[line(`# service=${service}\n`),pktFlush()];const head=r.refs.get(r.headRef)||ZERO,refs=refsSorted(r);
  if(!refs.length)out.push(line(`${ZERO} capabilities^{}\0${caps}\n`));else{out.push(line(`${head} HEAD\0${caps}\n`));for(const [name,oid] of refs){out.push(line(`${oid} ${name}\n`));const o=r.objects.get(oid);if(name.startsWith('refs/tags/')&&o?.type==='tag')out.push(line(`${parseTag(o.data).object} ${name}^{}\n`));}}
