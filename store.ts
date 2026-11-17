@@ -14,3 +14,4 @@ export class Store {
  repo(owner:string,name:string):RepoRecord|undefined{return this.repos.get(`${owner}/${name}`);}
  createRepo(ownerLogin:string,name:string,description=''):RepoRecord{const databaseId=this.nextId(),now=this.tick();const r:RepoRecord={databaseId,nodeId:globalId('Repository',databaseId),ownerLogin,name,description,isPrivate:false,defaultBranch:'main',createdAt:now,updatedAt:now,objects:new Map(),refs:new Map(),headRef:'refs/heads/main',issues:new Map(),pulls:new Map(),labels:new Map(),comments:new Map(),nextNumber:1};this.repos.set(`${ownerLogin}/${name}`,r);return r;}
 }
+export const store = new Store();

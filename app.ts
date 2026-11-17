@@ -1,49 +1,12 @@
-// The starter's HTTP surface, exactly as it ships: a health probe and an API root, and a JSON 404
-// for everything else. The contest's real surface — git smart HTTP, REST v3 resources, GraphQL v4 and
-// the MCP endpoint — is what you add (README.md names it, and the rules link below says what scores).
-//
-// app.ts is deliberately separate from main.ts: this is the server, the file you grow; main.ts is the
-// entry <-> env lifecycle and should stay as it is.
-
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-
-const JSON_TYPE = 'application/json; charset=utf-8';
-
-/** Answer one request with a JSON body; `headers` go beside the JSON ones. */
-function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), ...headers });
-  res.end(text);
-}
-
-/** The path of a request URL, or '/' when it does not parse (never a throw from a request). */
-function pathOf(req: IncomingMessage): string {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
-  } catch {
-    return '/';
-  }
-}
-
-/** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
-export function createApp(): Server {
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
-    const path = pathOf(req);
-    const method = req.method ?? 'GET';
-
-    // The env's boot check calls this twice: 200 {"ok":true}.
-    if (method === 'GET' && path === '/healthz') {
-      sendJson(res, 200, { ok: true });
-      return;
-    }
-
-    // The GitHub API root: a 200 with the token's scopes, as api.github.com answers GET /.
-    if (method === 'GET' && (path === '/api/v3' || path === '/api/v3/')) {
-      sendJson(res, 200, { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit' }, { 'x-oauth-scopes': 'repo, read:org' });
-      return;
-    }
-
-    // Everything else, every method: GitHub's 404 body.
-    sendJson(res, 404, { message: 'Not Found' });
-  });
-}
+import { store } from './store.ts';
+import { handleInfoRefs, handleUploadPack, handleReceivePack } from './gitproto.ts';
+const JSON_TYPE='application/json; charset=utf-8';
+function json(res:ServerResponse,status:number,value:unknown){const body=Buffer.from(`${JSON.stringify(value)}\n`);res.writeHead(status,{'content-type':JSON_TYPE,'content-length':body.length});res.end(body);}
+function readBody(req:IncomingMessage):Promise<Buffer>{return new Promise((resolve,reject)=>{const chunks:Buffer[]=[];let size=0;req.on('data',(c:Buffer)=>{size+=c.length;if(size>64*1024*1024){reject(Error('request body too large'));req.destroy();return;}chunks.push(Buffer.from(c));});req.on('end',()=>resolve(Buffer.concat(chunks)));req.on('error',reject);});}
+function send(res:ServerResponse,r:{status:number;contentType:string;body:Buffer}){res.writeHead(r.status,{'content-type':r.contentType,'content-length':r.body.length});res.end(r.body);}
+export function createForgeServer():Server{const server=createServer(async(req,res)=>{try{const url=new URL(req.url??'/','http://entry'),path=url.pathname,method=req.method??'GET';if(method==='GET'&&path==='/healthz'){json(res,200,{status:'ok'});return;}if(!/^Bearer\s+\S/.test(req.headers.authorization??'')){json(res,401,{message:'Requires authentication'});return;}
+ const m=/^\/([^/]+)\/([^/]+?)(?:\.git)?\/(info\/refs|git-upload-pack|git-receive-pack)$/.exec(path);if(m){const owner=decodeURIComponent(m[1]!),name=decodeURIComponent(m[2]!),route=m[3]!;if(route==='info/refs'&&method==='GET'){const result=handleInfoRefs(store,owner,name,url.searchParams.get('service')??'',String(req.headers['git-protocol']??''));if(!result)json(res,404,{message:'Not Found'});else send(res,result);return;}if(route==='git-upload-pack'&&method==='POST'){if(!store.repo(owner,name)){json(res,404,{message:'Not Found'});return;}const body=await readBody(req);send(res,handleUploadPack(store,owner,name,body,String(req.headers['git-protocol']??'')));return;}if(route==='git-receive-pack'&&method==='POST'){if(!store.repo(owner,name)){json(res,404,{message:'Not Found'});return;}const body=await readBody(req);send(res,handleReceivePack(store,owner,name,body));return;}}
+ json(res,404,{message:'Not Found'});}catch(e){if(!res.headersSent)json(res,e instanceof Error&&e.message==='request body too large'?413:400,{message:e instanceof Error?e.message:'Bad Request'});else res.destroy();}});server.keepAliveTimeout=75000;server.headersTimeout=80000;return server;}
+/** Starter-compatible alias. */
+export function createApp():Server{return createForgeServer();}
