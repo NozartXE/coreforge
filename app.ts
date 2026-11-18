@@ -1,7 +1,7 @@
 import { createServer, type Socket, type Server } from 'node:net';
 import { store } from './store.ts';
 import { handleInfoRefs, handleUploadPack, handleReceivePack } from './gitproto.ts';
-import { handleRest } from './rest.ts';
+import { handleRest, cachedIssueReply } from './rest.ts';
 import { handleGraphQL } from './graphql.ts';
 import { handleMCP } from './mcp.ts';
 
@@ -13,14 +13,29 @@ export type DispatchReply={status:number;headers:Record<string,string>;body:stri
 function json(status:number,value:unknown,headers:Record<string,string>={}):DispatchReply{const body=`${JSON.stringify(value)}\n`;return {status,headers:{'content-type':JSON_TYPE,'content-length':String(Buffer.byteLength(body)),...headers},body};}
 function restReply(status:number,body:string,headers:Record<string,string>={},pre?:{buf:Buffer;len:number}):DispatchReply{return {status,headers:{'content-type':JSON_TYPE,'content-length':String(pre?pre.len:Buffer.byteLength(body)),'X-GitHub-Request-Id':`req-${++requestCounter}`,...headers},body:pre?pre.buf:body};}
 function send(r:{status:number;contentType:string;body:Buffer}):DispatchReply{return {status:r.status,headers:{'content-type':r.contentType,'content-length':String(r.body.length)},body:r.body};}
+function serviceParam(rawQuery:string):string{if(rawQuery.includes('%')||rawQuery.includes('+'))return new URLSearchParams(rawQuery).get('service')??'';for(const part of rawQuery.split('&')){if(part==='service')return '';if(part.startsWith('service='))return part.slice(8);}return '';}
+function decSeg(s:string):string{return s.includes('%')?decodeURIComponent(s):s;}
+function fastIssueGet(path:string,ghHeaders:Record<string,string>,headers:Record<string,string>):DispatchReply|undefined{
+ if(path.includes('%'))return undefined;
+ const parts=path.split('/');
+ if(parts.length!==8||parts[1]!=='api'||parts[2]!=='v3'||parts[3]!=='repos'||parts[6]!=='issues')return undefined;
+ const owner=parts[4]!,name=parts[5]!,numText=parts[7]!;
+ if(!owner||!name||!/^\d+$/.test(numText))return undefined;
+ const r=store.repo(owner,name);if(!r)return undefined;
+ const n=Number(numText);if(!r.issues.has(n))return undefined;
+ const hit=cachedIssueReply(store,owner,name,n,String(headers.host||'localhost'));if(!hit)return undefined;
+ return restReply(200,hit.body,ghHeaders,{buf:hit.buf,len:hit.len});
+}
 export function dispatch(method:string,target:string,headers:Record<string,string>,body:Buffer):DispatchReply{
- const queryAt=target.indexOf('?'),path=(queryAt<0?target:target.slice(0,queryAt))||'/',searchParams=queryAt<0?EMPTY_PARAMS:new URLSearchParams(target.slice(queryAt+1));
+ const queryAt=target.indexOf('?'),path=(queryAt<0?target:target.slice(0,queryAt))||'/',rawQuery=queryAt<0?'':target.slice(queryAt+1);
  if(method==='GET'&&path==='/healthz')return json(200,{status:'ok'});
  if(path==='/mcp'&&method==='POST'){if(!/^Bearer\s+\S/.test(headers.authorization??''))return json(401,{message:'Requires authentication'});const result=handleMCP(store,body,String(headers.host||'localhost'));return {status:result.status,headers:{'content-type':JSON_TYPE,'content-length':String(Buffer.byteLength(result.body)),...result.headers},body:Buffer.from(result.body)};}
  if(path==='/api/graphql'&&method==='POST'){const ghHeaders={'X-GitHub-Request-Id':`req-${++requestCounter}`};if(!/^Bearer\s+\S/.test(headers.authorization??''))return restReply(401,JSON.stringify({message:'Requires authentication'}),ghHeaders);let parsed:unknown;try{parsed=JSON.parse(body.toString('utf8'));}catch{return restReply(400,JSON.stringify({message:'Problems parsing JSON'}),ghHeaders);}const result=handleGraphQL(store,parsed,String(headers.host||'localhost'));return restReply(result.status,result.body,ghHeaders);}
- if(path.startsWith('/api/v3')){const ghHeaders={'X-GitHub-Request-Id':`req-${++requestCounter}`,'X-OAuth-Scopes':'repo'};if(!/^Bearer\s+\S/.test(headers.authorization??''))return restReply(401,JSON.stringify({message:'Requires authentication'}),ghHeaders);let raw=Buffer.alloc(0),parsed:unknown={};if(method==='POST'||method==='PUT'||method==='PATCH'||method==='DELETE'){raw=body;const ct=String(headers['content-type']||'');if(raw.length&&/json/i.test(ct)){try{parsed=JSON.parse(raw.toString('utf8'));}catch{return restReply(400,JSON.stringify({message:'Problems parsing JSON'}),ghHeaders);}}}const result=handleRest(store,method,path,searchParams,raw,parsed,String(headers.host||'localhost'));if(result)return restReply(result.status,result.body,{...ghHeaders,...result.headers},result.buf?{buf:result.buf,len:result.len!}:undefined);return restReply(404,JSON.stringify({message:'Not Found'}),ghHeaders);}
+ if(path.startsWith('/api/v3')){const searchParams=queryAt<0?EMPTY_PARAMS:new URLSearchParams(rawQuery);const ghHeaders={'X-GitHub-Request-Id':`req-${++requestCounter}`,'X-OAuth-Scopes':'repo'};if(!/^Bearer\s+\S/.test(headers.authorization??''))return restReply(401,JSON.stringify({message:'Requires authentication'}),ghHeaders);let raw=Buffer.alloc(0),parsed:unknown={};if(method==='POST'||method==='PUT'||method==='PATCH'||method==='DELETE'){raw=body;const ct=String(headers['content-type']||'');if(raw.length&&/json/i.test(ct)){try{parsed=JSON.parse(raw.toString('utf8'));}catch{return restReply(400,JSON.stringify({message:'Problems parsing JSON'}),ghHeaders);}}}if(method==='GET'){const fl=fastIssueGet(path,ghHeaders,headers);if(fl)return fl;}const result=handleRest(store,method,path,searchParams,raw,parsed,String(headers.host||'localhost'));if(result)return restReply(result.status,result.body,{...ghHeaders,...result.headers},result.buf?{buf:result.buf,len:result.len!}:undefined);return restReply(404,JSON.stringify({message:'Not Found'}),ghHeaders);}
  if(!/^Bearer\s+\S/.test(headers.authorization??''))return json(401,{message:'Requires authentication'});
- const m=/^\/([^/]+)\/([^/]+?)(?:\.git)?\/(info\/refs|git-upload-pack|git-receive-pack)$/.exec(path);if(m){const owner=decodeURIComponent(m[1]!),name=decodeURIComponent(m[2]!),route=m[3]!;if(route==='info/refs'&&method==='GET'){const result=handleInfoRefs(store,owner,name,searchParams.get('service')??'',String(headers['git-protocol']??''));return result?send(result):json(404,{message:'Not Found'});}if(route==='git-upload-pack'&&method==='POST'){if(!store.repo(owner,name))return json(404,{message:'Not Found'});return send(handleUploadPack(store,owner,name,body,String(headers['git-protocol']??'')));}if(route==='git-receive-pack'&&method==='POST'){if(!store.repo(owner,name))return json(404,{message:'Not Found'});return send(handleReceivePack(store,owner,name,body));}}
+ const seg=path.split('/');
+ let route='';if(seg.length===4&&(seg[3]==='git-upload-pack'||seg[3]==='git-receive-pack'))route=seg[3]!;else if(seg.length===5&&seg[3]==='info'&&seg[4]==='refs')route='info/refs';
+ if(route!==''&&seg[0]===''&&seg[1]!==''&&seg[2]!==''){let nameRaw=seg[2]!;if(nameRaw.length>4&&nameRaw.endsWith('.git'))nameRaw=nameRaw.slice(0,-4);else if(nameRaw==='.git')nameRaw='.';const owner=decSeg(seg[1]!),name=decSeg(nameRaw);if(route==='info/refs'&&method==='GET'){const result=handleInfoRefs(store,owner,name,serviceParam(rawQuery),String(headers['git-protocol']??''));return result?send(result):json(404,{message:'Not Found'});}if(route==='git-upload-pack'&&method==='POST'){if(!store.repo(owner,name))return json(404,{message:'Not Found'});return send(handleUploadPack(store,owner,name,body,String(headers['git-protocol']??'')));}if(route==='git-receive-pack'&&method==='POST'){if(!store.repo(owner,name))return json(404,{message:'Not Found'});return send(handleReceivePack(store,owner,name,body));}}
  return json(404,{message:'Not Found'});
 }
 
@@ -28,7 +43,43 @@ export type ParsedRequest={method:string;target:string;version:string;headers:Re
 export type ParseResult={request:ParsedRequest|null;error?:'bad'|'too-large';headersComplete:boolean};
 const MAX_BODY=64*1024*1024;
 export function requestTargetOf(buf:Buffer):string{const end=buf.indexOf('\r\n');if(end<0)return '';const line=buf.toString('latin1',0,end),parts=line.split(' ');return parts.length>=2?parts[1]||'':'';}
-export function tryParseRequest(buf:Buffer):ParseResult{
+const TRIM_BYTES=new Set([9,10,11,12,13,32,160]);
+function tryParseFast(buf:Buffer):ParseResult|undefined{
+ const end=buf.indexOf('\r\n\r\n');if(end<0)return undefined;
+ const lineEnd=buf.indexOf('\r\n'),line=buf.toString('latin1',0,lineEnd);
+ const s1=line.indexOf(' ');if(s1<=0)return undefined;
+ const s2=line.indexOf(' ',s1+1);if(s2<=s1+1)return undefined;
+ const verText=line.slice(s2+1);if(verText!=='HTTP/1.0'&&verText!=='HTTP/1.1')return undefined;
+ const method=line.slice(0,s1),target=line.slice(s1+1,s2),version=verText==='HTTP/1.0'?'1.0':'1.1';
+ const headers:Record<string,string>={},lengths:string[]=[];
+ let pos=lineEnd+2;
+ while(pos<end){
+  const nl=buf.indexOf('\r\n',pos);if(nl<0||nl>end)return undefined;
+  let colon=-1;
+  for(let i=pos;i<nl;i++){const c=buf[i]!;if(c===13||c===10)return undefined;if(c===58&&colon<0)colon=i;}
+  if(colon<=pos)return undefined;
+  let ks=pos,ke=colon;while(ks<ke&&TRIM_BYTES.has(buf[ks]!))ks++;while(ke>ks&&TRIM_BYTES.has(buf[ke-1]!))ke--;
+  if(ks>=ke)return undefined;
+  for(let i=ks;i<ke;i++)if(buf[i]!>=128)return undefined;
+  const key=buf.toString('latin1',ks,ke).toLowerCase();
+  let vs=colon+1,ve=nl;while(vs<ve&&TRIM_BYTES.has(buf[vs]!))vs++;while(ve>vs&&TRIM_BYTES.has(buf[ve-1]!))ve--;
+  const value=buf.toString('latin1',vs,ve);
+  if(key==='content-length')lengths.push(value);
+  if(headers[key]!==undefined&&key!=='content-length')headers[key]+=', '+value;else headers[key]=value;
+  pos=nl+2;
+ }
+ if(headers['transfer-encoding']!==undefined)return undefined;
+ if(lengths.length>1||lengths.some(x=>!/^\d+$/.test(x)))return undefined;
+ const n=lengths.length?Number(lengths[0]):0;
+ if(!Number.isSafeInteger(n)||n>MAX_BODY)return undefined;
+ if(buf.length<end+4+n)return undefined;
+ const consumed=end+4+n,body=buf.subarray(end+4,consumed);
+ const conn=(headers.connection||'').toLowerCase().split(',').map(x=>x.trim());
+ const close=conn.includes('close')||(version==='1.0'&&!conn.includes('keep-alive'));
+ return {request:{method,target,version,headers,body,consumed,close},headersComplete:true};
+}
+export function tryParseRequest(buf:Buffer):ParseResult{return tryParseFast(buf)??parseRequestSlow(buf);}
+function parseRequestSlow(buf:Buffer):ParseResult{
  const end=buf.indexOf('\r\n\r\n');if(end<0)return {request:null,headersComplete:false};
  const lines=buf.toString('latin1',0,end).split('\r\n'),first=/^([^ ]+) ([^ ]+) HTTP\/(1\.[01])$/.exec(lines.shift()||'');if(!first)return {request:null,error:'bad',headersComplete:true};
  const headers:Record<string,string>={},lengths:string[]=[];for(const line of lines){const i=line.indexOf(':');if(i<=0||/[\r\n]/.test(line))return {request:null,error:'bad',headersComplete:true};const key=line.slice(0,i).trim().toLowerCase(),value=line.slice(i+1).trim();if(!key)return {request:null,error:'bad',headersComplete:true};if(key==='content-length')lengths.push(value);if(headers[key]!==undefined&&key!=='content-length')headers[key]+=', '+value;else headers[key]=value;}
