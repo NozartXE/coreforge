@@ -43,29 +43,25 @@ export type ParsedRequest={method:string;target:string;version:string;headers:Re
 export type ParseResult={request:ParsedRequest|null;error?:'bad'|'too-large';headersComplete:boolean};
 const MAX_BODY=64*1024*1024;
 export function requestTargetOf(buf:Buffer):string{const end=buf.indexOf('\r\n');if(end<0)return '';const line=buf.toString('latin1',0,end),parts=line.split(' ');return parts.length>=2?parts[1]||'':'';}
-const TRIM_BYTES=new Set([9,10,11,12,13,32,160]);
 function tryParseFast(buf:Buffer):ParseResult|undefined{
  const end=buf.indexOf('\r\n\r\n');if(end<0)return undefined;
- const lineEnd=buf.indexOf('\r\n'),line=buf.toString('latin1',0,lineEnd);
+ const head=buf.toString('latin1',0,end),le=head.indexOf('\r\n'),line=le<0?head:head.slice(0,le);
  const s1=line.indexOf(' ');if(s1<=0)return undefined;
  const s2=line.indexOf(' ',s1+1);if(s2<=s1+1)return undefined;
  const verText=line.slice(s2+1);if(verText!=='HTTP/1.0'&&verText!=='HTTP/1.1')return undefined;
  const method=line.slice(0,s1),target=line.slice(s1+1,s2),version=verText==='HTTP/1.0'?'1.0':'1.1';
  const headers:Record<string,string>={},lengths:string[]=[];
- let pos=lineEnd+2;
- while(pos<end){
-  const nl=buf.indexOf('\r\n',pos);if(nl<0||nl>end)return undefined;
-  let colon=-1;
-  for(let i=pos;i<nl;i++){const c=buf[i]!;if(c===13||c===10)return undefined;if(c===58&&colon<0)colon=i;}
-  if(colon<=pos)return undefined;
-  let ks=pos,ke=colon;while(ks<ke&&TRIM_BYTES.has(buf[ks]!))ks++;while(ke>ks&&TRIM_BYTES.has(buf[ke-1]!))ke--;
-  if(ks>=ke)return undefined;
-  for(let i=ks;i<ke;i++)if(buf[i]!>=128)return undefined;
-  const key=buf.toString('latin1',ks,ke).toLowerCase();
-  let vs=colon+1,ve=nl;while(vs<ve&&TRIM_BYTES.has(buf[vs]!))vs++;while(ve>vs&&TRIM_BYTES.has(buf[ve-1]!))ve--;
-  const value=buf.toString('latin1',vs,ve);
+ let pos=le<0?head.length:le+2;
+ while(pos<head.length){
+  const nl=head.indexOf('\r\n',pos),ln=nl<0?head.slice(pos):head.slice(pos,nl);
+  if(ln.includes('\r')||ln.includes('\n'))return undefined;
+  const i=ln.indexOf(':');if(i<=0)return undefined;
+  const keyTrimmed=ln.slice(0,i).trim();if(!keyTrimmed)return undefined;
+  for(let k=0;k<keyTrimmed.length;k++)if(keyTrimmed.charCodeAt(k)>=128)return undefined;
+  const key=keyTrimmed.toLowerCase(),value=ln.slice(i+1).trim();
   if(key==='content-length')lengths.push(value);
   if(headers[key]!==undefined&&key!=='content-length')headers[key]+=', '+value;else headers[key]=value;
+  if(nl<0)break;
   pos=nl+2;
  }
  if(headers['transfer-encoding']!==undefined)return undefined;
